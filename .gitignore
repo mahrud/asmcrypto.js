@@ -1,4 +1,4 @@
-asmcrypto*.js
+asmcrypto.*.js
 asmcrypto*.mjs
 asmcrypto*.map
 test/aes.asm.js
