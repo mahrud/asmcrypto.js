@@ -116,7 +116,16 @@
       return btoa(bytes_to_string(arr));
     }
 
-
+    function pow2_ceil(a) {
+      a -= 1;
+      a |= a >>> 1;
+      a |= a >>> 2;
+      a |= a >>> 4;
+      a |= a >>> 8;
+      a |= a >>> 16;
+      a += 1;
+      return a;
+    }
 
     function is_number(a) {
       return typeof a === 'number';
@@ -169,24 +178,6 @@
     /**
      * Util exports
      */
-
-    function IllegalStateError() {
-      var err = Error.apply(this, arguments);
-      this.message = err.message, this.stack = err.stack;
-    }
-    IllegalStateError.prototype = Object.create(Error.prototype, { name: { value: 'IllegalStateError' } });
-
-    function IllegalArgumentError() {
-      var err = Error.apply(this, arguments);
-      this.message = err.message, this.stack = err.stack;
-    }
-    IllegalArgumentError.prototype = Object.create(Error.prototype, { name: { value: 'IllegalArgumentError' } });
-
-    function SecurityError() {
-      var err = Error.apply(this, arguments);
-      this.message = err.message, this.stack = err.stack;
-    }
-    SecurityError.prototype = Object.create(Error.prototype, { name: { value: 'SecurityError' } });
 
     /**
      * @file {@link http://asmjs.org Asm.js} implementation of the {@link https://en.wikipedia.org/wiki/Advanced_Encryption_Standard Advanced Encryption Standard}.
@@ -994,6 +985,24 @@
     // shared asm.js module and heap
     var _AES_heap_instance = new Uint8Array(0x100000); // 1MB
     var _AES_asm_instance = AES_asm(null, _AES_heap_instance.buffer);
+
+    function IllegalStateError() {
+      var err = Error.apply(this, arguments);
+      this.message = err.message, this.stack = err.stack;
+    }
+    IllegalStateError.prototype = Object.create(Error.prototype, { name: { value: 'IllegalStateError' } });
+
+    function IllegalArgumentError() {
+      var err = Error.apply(this, arguments);
+      this.message = err.message, this.stack = err.stack;
+    }
+    IllegalArgumentError.prototype = Object.create(Error.prototype, { name: { value: 'IllegalArgumentError' } });
+
+    function SecurityError() {
+      var err = Error.apply(this, arguments);
+      this.message = err.message, this.stack = err.stack;
+    }
+    SecurityError.prototype = Object.create(Error.prototype, { name: { value: 'SecurityError' } });
 
     class AES {
       constructor(key, iv, padding, heap, asm) {
@@ -5815,6 +5824,9 @@
     var _bigint_heap = new Uint32Array(0x100000);
     var _bigint_asm;
 
+    // Small primes for trail division
+    const _primes = [2, 3 /* and so on, computed lazily */];
+
     function _half_imul(a, b) {
       return (a * b) | 0;
     }
@@ -6410,13 +6422,83 @@
     const BigNumber_ONE = BigNumber.fromNumber(1);
 
     /**
+     * Returns an array populated with first n primes.
+     *
+     * @param {number} n
+     * @return {number[]}
+     * @private
+     */
+    function _small_primes(n) {
+      if (_primes.length >= n) return _primes.slice(0, n);
+
+      for (let p = _primes[_primes.length - 1] + 2; _primes.length < n; p += 2) {
+        for (var i = 0, d = _primes[i]; d * d <= p; d = _primes[++i]) {
+          if (p % d == 0) break;
+        }
+        if (d * d > p) _primes.push(p);
+      }
+
+      return _primes;
+    }
+
+    /**
      * Returns strong pseudoprime of a specified bit length
      *
      * @param {number} bitlen
      * @param {function(BigNumber): boolean} filter
      * @return {BigNumber}
      */
+    function randomProbablePrime(bitlen, filter) {
+      let limbcnt = (bitlen + 31) >> 5;
+      const prime = BigNumber.fromConfig({ sign: 1, bitLength: bitlen, limbs: new Uint32Array(limbcnt) });
+      const limbs = prime.limbs;
 
+      // Number of small divisors to try that minimizes the total cost of the trial division
+      // along with the first round of Miller-Rabin test for a certain bit length.
+      let k = 10000;
+      if (bitlen <= 512) k = 2200;
+      if (bitlen <= 256) k = 600;
+
+      let divisors = _small_primes(k);
+      const remainders = new Uint32Array(k);
+
+      // Number of Miller-Rabin iterations for an error rate  of less than 2^-80
+      // Damgaard, Landrock, Pomerance: Average case error estimates for the strong probable prime test.
+      const s = (bitlen * Math.LN2) | 0;
+      let r = 27;
+      if (bitlen >= 250) r = 12;
+      if (bitlen >= 450) r = 6;
+      if (bitlen >= 850) r = 3;
+      if (bitlen >= 1300) r = 2;
+
+      while (true) {
+        // populate `prime` with random bits, clamp to the appropriate bit length
+        Random_getValues(limbs);
+        limbs[0] |= 1;
+        limbs[limbcnt - 1] |= 1 << ((bitlen - 1) & 31);
+        if (bitlen & 31) limbs[limbcnt - 1] &= pow2_ceil((bitlen + 1) & 31) - 1;
+
+        // remainders from division to small primes
+        remainders[0] = 1;
+        for (let i = 1; i < k; i++) {
+          remainders[i] = prime.divide(BigNumber.fromNumber(divisors[i])).remainder.valueOf();
+        }
+
+        // try no more than `s` subsequent candidates
+        seek: for (let j = 0; j < s; j += 2, limbs[0] += 2) {
+          // check for small factors
+          for (let i = 1; i < k; i++) {
+            if ((remainders[i] + j) % divisors[i] === 0) continue seek;
+          }
+
+          // additional check just before the heavy lifting
+          if (typeof filter === 'function' && !filter(prime)) continue;
+
+          // proceed to Miller-Rabin test
+          if (prime.isMillerRabinProbablePrime(r)) return prime;
+        }
+      }
+    }
 
     class Modulus extends BigNumber {
       /**
@@ -6603,21 +6685,246 @@
       return result;
     }
 
-    BigNumber.ZERO = BigNumber_ZERO;
-    BigNumber.ONE = BigNumber_ONE;
+    function RSA(options) {
+      options = options || {};
 
-    BigNumber.extGCD = BigNumber_extGCD;
+      this.key = null;
+      this.result = null;
 
-    var _global_console$1 = typeof console !== 'undefined' ? console : undefined;
-
-    var _secure_origin =
-      typeof location === 'undefined' || !location.protocol.search(/https:|file:|chrome:|chrome-extension:|moz-extension:/);
-
-    if (!_secure_origin && _global_console$1 !== undefined) {
-      _global_console$1.warn(
-        'asmCrypto seems to be load from an insecure origin; this may cause to MitM-attack vulnerability. Consider using secure transport protocol.',
-      );
+      this.reset(options);
     }
+
+    function RSA_reset(options) {
+      options = options || {};
+
+      this.result = null;
+
+      var key = options.key;
+      if (key !== undefined) {
+        if (key instanceof Array) {
+          var l = key.length;
+          if (l !== 2 && l !== 3 && l !== 8) throw new SyntaxError('unexpected key type');
+
+          var k = [];
+          k[0] = new Modulus(new BigNumber(key[0]));
+          k[1] = new BigNumber(key[1]);
+          if (l > 2) {
+            k[2] = new BigNumber(key[2]);
+          }
+          if (l > 3) {
+            k[3] = new Modulus(new BigNumber(key[3]));
+            k[4] = new Modulus(new BigNumber(key[4]));
+            k[5] = new BigNumber(key[5]);
+            k[6] = new BigNumber(key[6]);
+            k[7] = new BigNumber(key[7]);
+          }
+
+          this.key = k;
+        } else {
+          throw new TypeError('unexpected key type');
+        }
+      }
+
+      return this;
+    }
+
+    function RSA_encrypt(data) {
+      if (!this.key) throw new IllegalStateError('no key is associated with the instance');
+
+      if (is_string(data)) data = string_to_bytes(data);
+
+      if (is_buffer(data)) data = new Uint8Array(data);
+
+      var msg;
+      if (is_bytes(data)) {
+        msg = new BigNumber(data);
+      } else if (is_big_number(data)) {
+        msg = data;
+      } else {
+        throw new TypeError('unexpected data type');
+      }
+
+      if (this.key[0].compare(msg) <= 0) throw new RangeError('data too large');
+
+      var m = this.key[0],
+        e = this.key[1];
+
+      var result = m.power(msg, e).toBytes();
+
+      var bytelen = (m.bitLength + 7) >> 3;
+      if (result.length < bytelen) {
+        var r = new Uint8Array(bytelen);
+        r.set(result, bytelen - result.length);
+        result = r;
+      }
+
+      this.result = result;
+
+      return this;
+    }
+
+    function RSA_decrypt(data) {
+      if (!this.key) throw new IllegalStateError('no key is associated with the instance');
+
+      if (this.key.length < 3) throw new IllegalStateError("key isn't suitable for decription");
+
+      if (is_string(data)) data = string_to_bytes(data);
+
+      if (is_buffer(data)) data = new Uint8Array(data);
+
+      var msg;
+      if (is_bytes(data)) {
+        msg = new BigNumber(data);
+      } else if (is_big_number(data)) {
+        msg = data;
+      } else {
+        throw new TypeError('unexpected data type');
+      }
+
+      if (this.key[0].compare(msg) <= 0) throw new RangeError('data too large');
+
+      var result;
+      if (this.key.length > 3) {
+        var m = this.key[0],
+          p = this.key[3],
+          q = this.key[4],
+          dp = this.key[5],
+          dq = this.key[6],
+          u = this.key[7];
+
+        var x = p.power(msg, dp),
+          y = q.power(msg, dq);
+
+        var t = x.subtract(y);
+        while (t.sign < 0) t = t.add(p);
+
+        var h = p.reduce(u.multiply(t));
+
+        result = h
+          .multiply(q)
+          .add(y)
+          .clamp(m.bitLength)
+          .toBytes();
+      } else {
+        var m = this.key[0],
+          d = this.key[2];
+
+        result = m.power(msg, d).toBytes();
+      }
+
+      var bytelen = (m.bitLength + 7) >> 3;
+      if (result.length < bytelen) {
+        var r = new Uint8Array(bytelen);
+        r.set(result, bytelen - result.length);
+        result = r;
+      }
+
+      this.result = result;
+
+      return this;
+    }
+
+    var RSA_prototype = RSA.prototype;
+    RSA_prototype.reset = RSA_reset;
+    RSA_prototype.encrypt = RSA_encrypt;
+    RSA_prototype.decrypt = RSA_decrypt;
+
+    /**
+     * Generate RSA key pair
+     *
+     * @param bitlen desired modulus length, default is 2048
+     * @param e public exponent, default is 65537
+     */
+    function RSA_generateKey(bitlen, e) {
+      bitlen = bitlen || 2048;
+      e = e || 65537;
+
+      if (bitlen < 512) throw new IllegalArgumentError('bit length is too small');
+
+      if (is_string(e)) e = string_to_bytes(e);
+
+      if (is_buffer(e)) e = new Uint8Array(e);
+
+      if (is_bytes(e)) {
+        e = new BigNumber(e);
+      } else if (is_number(e)) {
+        e = BigNumber.fromNumber(e);
+      } else if (is_big_number(e)) {
+        e = BigNumber.fromConfig(e);
+      } else {
+        throw new TypeError('unexpected exponent type');
+      }
+
+      if ((e.limbs[0] & 1) === 0) throw new IllegalArgumentError('exponent must be an odd number');
+
+      var m, e, d, p, q, p1, q1, dp, dq, u;
+
+      p = randomProbablePrime(bitlen >> 1, function(p) {
+        p1 = BigNumber.fromConfig(p);
+        p1.limbs[0] -= 1;
+        return BigNumber_extGCD(p1, e).gcd.valueOf() == 1;
+      });
+
+      q = randomProbablePrime(bitlen - (bitlen >> 1), function(q) {
+        m = new Modulus(p.multiply(q));
+        if (!(m.limbs[((bitlen + 31) >> 5) - 1] >>> ((bitlen - 1) & 31))) return false;
+        q1 = BigNumber.fromConfig(q);
+        q1.limbs[0] -= 1;
+        return BigNumber_extGCD(q1, e).gcd.valueOf() == 1;
+      });
+
+      d = new Modulus(p1.multiply(q1)).inverse(e);
+
+      dp = d.divide(p1).remainder, dq = d.divide(q1).remainder;
+
+      p = new Modulus(p), q = new Modulus(q);
+
+      var u = p.inverse(q);
+
+      return [m, e, d, p, q, dp, dq, u];
+    }
+
+    RSA.generateKey = RSA_generateKey;
+
+    /**
+     * RSA keygen exports
+     */
+    function rsa_generate_key(bitlen, e) {
+      if (bitlen === undefined) throw new SyntaxError('bitlen required');
+      if (e === undefined) throw new SyntaxError('e required');
+      var key = RSA_generateKey(bitlen, e);
+      for (var i = 0; i < key.length; i++) {
+        if (is_big_number(key[i])) key[i] = key[i].toBytes();
+      }
+      return key;
+    }
+
+    var RSA$2 = {
+      generateKey: rsa_generate_key,
+    };
+
+    /**
+     * RSA-RAW exports
+     */
+
+    function rsa_raw_encrypt_bytes(data, key) {
+      if (data === undefined) throw new SyntaxError('data required');
+      if (key === undefined) throw new SyntaxError('key required');
+      return new RSA({ key: key }).encrypt(data).result;
+    }
+
+    function rsa_raw_decrypt_bytes(data, key) {
+      if (data === undefined) throw new SyntaxError('data required');
+      if (key === undefined) throw new SyntaxError('key required');
+      return new RSA({ key: key }).decrypt(data).result;
+    }
+
+    var RSA_RAW = RSA;
+
+    RSA_RAW.encrypt = rsa_raw_encrypt_bytes;
+    RSA_RAW.decrypt = rsa_raw_decrypt_bytes;
+    RSA_RAW.sign = rsa_raw_decrypt_bytes;
+    RSA_RAW.verify = rsa_raw_encrypt_bytes;
 
     exports.string_to_bytes = string_to_bytes;
     exports.hex_to_bytes = hex_to_bytes;
@@ -6625,9 +6932,6 @@
     exports.bytes_to_string = bytes_to_string;
     exports.bytes_to_hex = bytes_to_hex;
     exports.bytes_to_base64 = bytes_to_base64;
-    exports.IllegalStateError = IllegalStateError;
-    exports.IllegalArgumentError = IllegalArgumentError;
-    exports.SecurityError = SecurityError;
     exports.AES_ECB = AES_ECB;
     exports.AES_ECB_Encrypt = AES_ECB_Encrypt;
     exports.AES_ECB_Decrypt = AES_ECB_Decrypt;
@@ -6638,8 +6942,10 @@
     exports.AES_GCM_Encrypt = AES_GCM_Encrypt;
     exports.AES_GCM_Decrypt = AES_GCM_Decrypt;
     exports.SHA256 = SHA256;
-    exports.BigNumber = BigNumber;
-    exports.Modulus = Modulus;
+    exports.RSA = RSA$2;
+    exports.RSA_RAW = RSA_RAW;
+    exports.random = Random_getNumber;
+    exports.getRandomValues = Random_getValues;
 
     Object.defineProperty(exports, '__esModule', { value: true });
 
